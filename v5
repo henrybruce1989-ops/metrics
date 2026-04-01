@@ -378,3 +378,208 @@ def signal_engine(high, low, open_, close, volume):
         "compression_expansion": compression
     }
     return radar
+
+# =========================================================
+# 第三部分：结构对齐、压缩扩张、CSV存储、Server酱推送、主程序循环
+# =========================================================
+
+import os
+import time
+import json
+import csv
+import requests
+import threading
+from datetime import datetime
+from collections import defaultdict
+import websocket
+
+# 假设 signal_engine 已经从前两部分导入
+# from radar_engine import signal_engine
+
+# ================= 配置 =================
+SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY", "sctp14659thuntd89pzhhlsmbwynooxu")
+CSV_FILE = "radar_signals.csv"
+REST_24H_TICKER = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+BASE_WS_URL = "wss://fstream.binance.com/stream?streams="
+INTERVAL = "1m"
+VOLUME_THRESHOLD_USDT = 15_000_000  # 1500万 USDT
+MAX_KLINES = 200  # 每个币对缓存最近200根K线
+PING_INTERVAL = 20
+
+# ================= K线缓存 =================
+klines_buffer = defaultdict(list)  # {symbol: list of bars}
+
+# ================= Server酱推送 =================
+def serverchan_push(title: str, desp: str):
+    """Server酱推送"""
+    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+    try:
+        resp = requests.post(url, data={"title": title, "desp": desp}, timeout=5)
+        if resp.status_code != 200:
+            print(f"[WARN] Server酱推送失败: {resp.text}")
+    except Exception as e:
+        print(f"[ERROR] Server酱推送异常: {e}")
+
+# ================= CSV存储 =================
+def save_signal_to_csv(file_path: str, symbol: str, price: float, radar: dict, signal_time: str):
+    """保存完整五角雷达信号到 CSV"""
+    fieldnames = [
+        "symbol", "signal_time", "price",
+        "liquidity_score", "liquidity_subtype",
+        "momentum_score", "momentum_subtype",
+        "volume_score", "volume_subtype",
+        "structure_score", "structure_subtype",
+        "compression_score", "compression_subtype"
+    ]
+    # 添加meta字段
+    for key in radar:
+        for meta_k in radar[key].get("meta", {}):
+            fieldnames.append(f"{key}_meta_{meta_k}")
+
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+
+        row = {
+            "symbol": symbol,
+            "signal_time": signal_time,
+            "price": price,
+            "liquidity_score": radar["liquidity_event"]["score"],
+            "liquidity_subtype": radar["liquidity_event"]["subtype"],
+            "momentum_score": radar["momentum_expansion"]["score"],
+            "momentum_subtype": radar["momentum_expansion"]["subtype"],
+            "volume_score": radar["volume_participation"]["score"],
+            "volume_subtype": radar["volume_participation"]["subtype"],
+            "structure_score": radar["structure_alignment"]["score"],
+            "structure_subtype": radar["structure_alignment"]["subtype"],
+            "compression_score": radar["compression_expansion"]["score"],
+            "compression_subtype": radar["compression_expansion"]["meta"]
+        }
+
+        for key in radar:
+            for meta_k, meta_v in radar[key].get("meta", {}).items():
+                row[f"{key}_meta_{meta_k}"] = meta_v
+
+        writer.writerow(row)
+
+# ================= 活跃币对筛选 =================
+def fetch_active_symbols(threshold_usdt: float = VOLUME_THRESHOLD_USDT) -> set:
+    """获取 24h 成交额超过阈值的币对"""
+    try:
+        resp = requests.get(REST_24H_TICKER, timeout=5)
+        data = resp.json()
+    except Exception as e:
+        print(f"[ERROR] 获取24h ticker失败: {e}")
+        return set()
+
+    active = set()
+    for d in data:
+        try:
+            sym = d["symbol"].lower()
+            vol = float(d["quoteVolume"])
+            if vol >= threshold_usdt:
+                active.add(sym)
+        except Exception:
+            continue
+
+    print(f"[INFO] 活跃币对数量: {len(active)}")
+    return active
+
+# ================= K线处理 =================
+def process_kline_message(msg: dict, symbol: str):
+    """
+    WebSocket实时K线消息
+    收盘后才计算雷达信号
+    """
+    k = msg["k"]
+    is_closed = k["x"]
+    o = float(k["o"])
+    h = float(k["h"])
+    l = float(k["l"])
+    c = float(k["c"])
+    v = float(k["v"])
+
+    klines_buffer[symbol].append({"o": o, "h": h, "l": l, "c": c, "v": v})
+
+    # 保留最近 MAX_KLINES 根K线
+    if len(klines_buffer[symbol]) > MAX_KLINES:
+        klines_buffer[symbol] = klines_buffer[symbol][-MAX_KLINES:]
+
+    # 收盘才计算
+    if not is_closed:
+        return
+
+    high = [x["h"] for x in klines_buffer[symbol]]
+    low = [x["l"] for x in klines_buffer[symbol]]
+    open_ = [x["o"] for x in klines_buffer[symbol]]
+    close = [x["c"] for x in klines_buffer[symbol]]
+    volume = [x["v"] for x in klines_buffer[symbol]]
+
+    radar = signal_engine(high, low, open_, close, volume)
+    price = close[-1]
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    # CSV 记录
+    save_signal_to_csv(CSV_FILE, symbol.upper(), price, radar, now)
+
+    # 推送 Server酱
+    direction = radar["momentum_expansion"]["direction"] or radar["liquidity_event"]["direction"] or "NONE"
+    title = f"[五角雷达] {symbol.upper()} {direction} {now}"
+    desp = f"方向: {direction}\n价格: {price}\n\n"
+    desp += "📊 五角雷达指标分数:\n"
+    desp += f"- 流动性: {radar['liquidity_event']['score']} ({radar['liquidity_event']['subtype']})\n"
+    desp += f"- 动量扩张: {radar['momentum_expansion']['score']} ({radar['momentum_expansion']['subtype']})\n"
+    desp += f"- 成交量参与: {radar['volume_participation']['score']} ({radar['volume_participation']['subtype']})\n"
+    desp += f"- 结构对齐: {radar['structure_alignment']['score']} ({radar['structure_alignment']['subtype']})\n"
+    desp += f"- 压缩扩张: {radar['compression_expansion']['score']} ({radar['compression_expansion']['meta']})\n\n"
+    desp += "🔍 Meta 详情:\n"
+    for k in radar:
+        for mk, mv in radar[k].get("meta", {}).items():
+            desp += f"- {k} | {mk}: {mv}\n"
+
+    serverchan_push(title, desp)
+    print(f"[{now}] {symbol.upper()} 信号推送完成 | 价格: {price}")
+
+# ================= WebSocket =================
+def start_ws(active_symbols: set):
+    """启动WebSocket监听"""
+    streams = "/".join([f"{sym}@kline_{INTERVAL}" for sym in active_symbols])
+    ws_url = f"{BASE_WS_URL}{streams}"
+
+    def on_message(ws, message):
+        msg = json.loads(message)
+        if "data" in msg:
+            data = msg["data"]
+            symbol = data["s"].lower()
+            process_kline_message(data, symbol)
+
+    def on_error(ws, error):
+        print(f"[WS ERROR] {error}")
+
+    def on_close(ws):
+        print("[WS CLOSED] 断开，尝试重新连接...")
+        time.sleep(5)
+        start_ws(active_symbols)
+
+    def on_open(ws):
+        print(f"[WS OPEN] 已连接 {len(active_symbols)} 个活跃币对")
+
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.on_open = on_open
+    ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=10)
+
+# ================= 主程序循环 =================
+if __name__ == "__main__":
+    print("[START] 五角雷达实时监控启动")
+    active_symbols = fetch_active_symbols()
+    if not active_symbols:
+        print("[WARN] 无符合条件的交易对，退出")
+        exit(0)
+    start_ws(active_symbols)
