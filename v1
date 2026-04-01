@@ -1,0 +1,650 @@
+#一、参数（全部可调，但给默认值）
+LOOKBACK = 30
+THRESHOLD = 0.001        # 0.1%
+WICK_RATIO_THRESHOLD = 1.5
+EXTREME_WICK_RATIO = 2.5
+MIN_BODY = 1e-6          # 防止除0
+
+#流动性触发（Liquidity Event）
+
+def liquidity_event(high, low, open_, close):
+    """
+    输入：array-like (至少 LOOKBACK+1 长度)
+    输出：dict
+    """
+
+    # === Layer 1: 流动性区 ===
+    prev_high = max(high[-LOOKBACK-1:-1])
+    prev_low  = min(low[-LOOKBACK-1:-1])
+
+    # === 当前K线 ===
+    h = high[-1]
+    l = low[-1]
+    o = open_[-1]
+    c = close[-1]
+
+    # === Layer 2: Sweep ===
+    sweep_high = h > prev_high * (1 + THRESHOLD)
+    sweep_low  = l < prev_low  * (1 - THRESHOLD)
+
+    # === Layer 3: Rejection ===
+    fake_break_high = sweep_high and c < prev_high
+    fake_break_low  = sweep_low  and c > prev_low
+
+    # === Wick计算 ===
+    body = abs(c - o)
+    body = max(body, MIN_BODY)
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    wick_ratio_up = upper_wick / body
+    wick_ratio_down = lower_wick / body
+
+    # === 强Rejection ===
+    strong_rejection_high = fake_break_high and wick_ratio_up > WICK_RATIO_THRESHOLD
+    strong_rejection_low  = fake_break_low  and wick_ratio_down > WICK_RATIO_THRESHOLD
+
+    # === 方向 ===
+    direction = None
+    if strong_rejection_low:
+        direction = "long"
+    elif strong_rejection_high:
+        direction = "short"
+    elif sweep_low:
+        direction = "long"
+    elif sweep_high:
+        direction = "short"
+
+    # === 评分 ===
+    score = 1
+
+    if sweep_high or sweep_low:
+        score += 3
+
+    if fake_break_high or fake_break_low:
+        score += 3
+
+    if strong_rejection_high or strong_rejection_low:
+        score += 2
+
+    if wick_ratio_up > EXTREME_WICK_RATIO or wick_ratio_down > EXTREME_WICK_RATIO:
+        score += 1
+
+    score = min(score, 10)
+
+    # === 子类型 ===
+    if score >= 8:
+        subtype = "strong_rejection"
+    elif score >= 6:
+        subtype = "rejection"
+    elif score >= 4:
+        subtype = "sweep"
+    else:
+        subtype = "none"
+
+    return {
+        "score": score,
+        "direction": direction,
+        "type": "liquidity_event",
+        "subtype": subtype,
+        "meta": {
+            "prev_high": prev_high,
+            "prev_low": prev_low,
+            "wick_ratio_up": wick_ratio_up,
+            "wick_ratio_down": wick_ratio_down
+        }
+    }
+# Momentum Expansion
+# 参数（统一入口，方便后续调参）
+MOMENTUM_LOOKBACK = 30
+
+MOMENTUM_THRESHOLD_1 = 1.5
+MOMENTUM_THRESHOLD_2 = 2.0
+MOMENTUM_THRESHOLD_EXTREME = 2.5
+
+STRONG_CLOSE_RATIO = 0.2     # 收在前20%/后20%
+CONSECUTIVE_COUNT = 3
+
+EPS = 1e-6
+# 核心函数（直接可用
+def momentum_expansion(high, low, open_, close):
+    """
+    Momentum Expansion Detector
+
+    输入：
+        high, low, open_, close -> list/array（长度 >= MOMENTUM_LOOKBACK + CONSECUTIVE_COUNT）
+
+    输出：
+        dict {
+            score: 1-10,
+            direction: "long" / "short" / None,
+            type: "momentum_expansion",
+            subtype: "explosive" / "strong" / "weak",
+            meta: {}
+        }
+    """
+
+    # === 数据长度保护 ===
+    if len(high) < MOMENTUM_LOOKBACK + CONSECUTIVE_COUNT:
+        return {
+            "score": 1,
+            "direction": None,
+            "type": "momentum_expansion",
+            "subtype": "invalid",
+            "meta": {}
+        }
+
+    # === Layer 1: Range Expansion ===
+    total_range = 0.0
+    for i in range(-MOMENTUM_LOOKBACK-1, -1):
+        total_range += (high[i] - low[i])
+
+    avg_range = total_range / MOMENTUM_LOOKBACK
+    current_range = high[-1] - low[-1]
+
+    momentum_ratio = current_range / (avg_range + EPS)
+
+    # === Layer 2: Close Strength ===
+    close_position = (close[-1] - low[-1]) / (current_range + EPS)
+
+    strong_close_long = close_position > (1 - STRONG_CLOSE_RATIO)
+    strong_close_short = close_position < STRONG_CLOSE_RATIO
+
+    # === Direction（允许无方向） ===
+    direction = None
+    if strong_close_long:
+        direction = "long"
+    elif strong_close_short:
+        direction = "short"
+
+    # === Layer 3: 连续K线（必须同方向） ===
+    def consecutive(direction_type):
+        for i in range(-CONSECUTIVE_COUNT, 0):
+            if direction_type == "bull":
+                if close[i] <= open_[i]:
+                    return False
+            elif direction_type == "bear":
+                if close[i] >= open_[i]:
+                    return False
+        return True
+
+    bull_seq = consecutive("bull")
+    bear_seq = consecutive("bear")
+
+    # === 评分系统 ===
+    score = 1
+
+    # 1️⃣ 动能基础
+    if momentum_ratio > MOMENTUM_THRESHOLD_1:
+        score += 3   # 4分
+
+    if momentum_ratio > MOMENTUM_THRESHOLD_2:
+        score += 2   # 6分
+
+    # 2️⃣ 收盘强度（决定方向有效性）
+    if strong_close_long or strong_close_short:
+        score += 2   # 8分
+
+    # 3️⃣ 连续动能（必须同方向）
+    if bull_seq or bear_seq:
+        score += 1   # 9分
+
+    # 4️⃣ 极端爆发
+    if momentum_ratio > MOMENTUM_THRESHOLD_EXTREME:
+        score += 1   # 10分
+
+    score = min(score, 10)
+
+    # === 子类型分类 ===
+    if score >= 9:
+        subtype = "explosive"
+    elif score >= 7:
+        subtype = "strong"
+    else:
+        subtype = "weak"
+
+    return {
+        "score": score,
+        "direction": direction,   # 允许 None
+        "type": "momentum_expansion",
+        "subtype": subtype,
+        "meta": {
+            "momentum_ratio": momentum_ratio,
+            "avg_range": avg_range,
+            "current_range": current_range,
+            "close_position": close_position,
+            "bull_seq": bull_seq,
+            "bear_seq": bear_seq
+        }
+    }
+# =========================================================
+# Volume Participation（成交量参与度检测）
+# 核心目标：
+# 判断当前价格波动是否有“真实资金参与”
+# =========================================================
+
+VOLUME_LOOKBACK = 30
+
+VOLUME_THRESHOLD_1 = 1.5      # 基础放量
+VOLUME_THRESHOLD_2 = 2.0      # 强放量
+VOLUME_THRESHOLD_EXTREME = 3.0  # 极端放量
+
+VOLUME_TREND_COUNT = 3        # 连续放量K线数量
+
+EPS = 1e-6
+
+
+def volume_participation(volume, close):
+    """
+    volume: list[float]  成交量序列
+    close:  list[float]  收盘价序列
+
+    return:
+        {
+            score: 1-10,
+            direction: long / short / None,
+            type: "volume_participation",
+            subtype: str,
+            meta: dict
+        }
+    """
+
+    # =========================
+    # 数据不足保护
+    # =========================
+    if len(volume) < VOLUME_LOOKBACK + 2:
+        return {
+            "score": 1,
+            "direction": None,
+            "type": "volume_participation",
+            "subtype": "invalid",
+            "meta": {}
+        }
+
+    # =========================
+    # 1️⃣ 计算放量倍数（当前 vs 历史均值）
+    # =========================
+    avg_volume = sum(volume[-VOLUME_LOOKBACK-1:-1]) / VOLUME_LOOKBACK
+    current_volume = volume[-1]
+
+    volume_ratio = current_volume / (avg_volume + EPS)
+
+    # =========================
+    # 2️⃣ 价格方向 & 量价关系
+    # =========================
+    price_up = close[-1] > close[-2]
+    price_down = close[-1] < close[-2]
+
+    volume_up = volume[-1] > volume[-2]
+
+    # ✅ 量价确认（核心）
+    confirm_long = price_up and volume_up
+    confirm_short = price_down and volume_up
+
+    # =========================
+    # 3️⃣ 方向判定（允许为 None）
+    # =========================
+    direction = None
+
+    if confirm_long:
+        direction = "long"
+    elif confirm_short:
+        direction = "short"
+    # ⚠️ 如果只是放量但价格无明显方向 → direction = None（允许存在）
+
+    # =========================
+    # 4️⃣ 连续放量检测（资金持续进场）
+    # =========================
+    def volume_trend():
+        for i in range(-VOLUME_TREND_COUNT, 0):
+            if volume[i] <= volume[i-1]:
+                return False
+        return True
+
+    sustained = volume_trend()
+
+    # =========================
+    # 5️⃣ 背离检测（弱惩罚版本）
+    # =========================
+    divergence_long = price_up and not volume_up
+    divergence_short = price_down and not volume_up
+
+    divergence = divergence_long or divergence_short
+
+    # =========================
+    # 6️⃣ 评分系统（1-10）
+    # =========================
+    score = 1
+
+    # 🔹 放量基础（核心权重）
+    if volume_ratio > VOLUME_THRESHOLD_1:
+        score += 3   # 4分
+
+    if volume_ratio > VOLUME_THRESHOLD_2:
+        score += 2   # 6分
+
+    # 🔹 量价确认（有方向更强）
+    if confirm_long or confirm_short:
+        score += 2   # 8分
+
+    # 🔹 连续放量（主力持续行为）
+    if sustained:
+        score += 1   # 9分
+
+    # 🔹 极端放量（爆发点）
+    if volume_ratio > VOLUME_THRESHOLD_EXTREME:
+        score += 1   # 10分
+
+    # ❗弱惩罚（你要求的）
+    if divergence:
+        score -= 1
+
+    # 限制范围
+    score = max(1, min(score, 10))
+
+    # =========================
+    # 7️⃣ 信号分类（用于后续策略分流）
+    # =========================
+    if score >= 9:
+        subtype = "explosive_volume"        # 爆发级资金
+    elif score >= 7:
+        subtype = "confirmed_volume"        # 有效参与
+    elif score >= 5:
+        subtype = "neutral_volume"          # 中性
+    else:
+        subtype = "weak_volume"             # 无效
+
+    # =========================
+    # 8️⃣ 输出
+    # =========================
+    return {
+        "score": score,
+        "direction": direction,
+        "type": "volume_participation",
+        "subtype": subtype,
+        "meta": {
+            "volume_ratio": volume_ratio,   # 放量倍数（核心指标）
+            "avg_volume": avg_volume,
+            "current_volume": current_volume,
+            "sustained": sustained,         # 是否连续放量
+            "divergence": divergence        # 是否量价背离
+        }
+    }
+# =========================================================
+# Structure Alignment v2.0（双结构系统）
+# Entry结构（20） + Bias结构（100）
+# =========================================================
+
+ENTRY_LOOKBACK = 30
+BIAS_LOOKBACK = 100
+SWING_WINDOW = 3
+
+
+def structure_alignment_v2(high, low, close, direction):
+
+    if len(close) < BIAS_LOOKBACK + SWING_WINDOW * 2:
+        return {
+            "score": 1,
+            "type": "structure_alignment",
+            "subtype": "invalid",
+            "meta": {}
+        }
+
+    # =====================================================
+    # 通用函数：计算结构趋势
+    # =====================================================
+    def detect_structure(high, low, close, lookback):
+
+        h = high[-lookback:]
+        l = low[-lookback:]
+        c = close[-lookback:]
+
+        def is_swing_high(i):
+            for j in range(1, SWING_WINDOW+1):
+                if h[i] <= h[i-j] or h[i] <= h[i+j]:
+                    return False
+            return True
+
+        def is_swing_low(i):
+            for j in range(1, SWING_WINDOW+1):
+                if l[i] >= l[i-j] or l[i] >= l[i+j]:
+                    return False
+            return True
+
+        swing_highs = []
+        swing_lows = []
+
+        for i in range(SWING_WINDOW, len(h) - SWING_WINDOW):
+            if is_swing_high(i):
+                swing_highs.append((i, h[i]))
+
+            if is_swing_low(i):
+                swing_lows.append((i, l[i]))
+
+        hh = hl = lh = ll = 0
+
+        for i in range(1, len(swing_highs)):
+            if swing_highs[i][1] > swing_highs[i-1][1]:
+                hh += 1
+            else:
+                lh += 1
+
+        for i in range(1, len(swing_lows)):
+            if swing_lows[i][1] > swing_lows[i-1][1]:
+                hl += 1
+            else:
+                ll += 1
+
+        total = hh + hl + lh + ll + 1e-6
+
+        bullish_score = (hh + hl) / total
+        bearish_score = (lh + ll) / total
+
+        if bullish_score > 0.6:
+            trend = "long"
+            strength = bullish_score
+        elif bearish_score > 0.6:
+            trend = "short"
+            strength = bearish_score
+        else:
+            trend = "range"
+            strength = max(bullish_score, bearish_score)
+
+        # 结构位置（仅用于entry）
+        last_high = swing_highs[-1][1] if swing_highs else None
+        last_low = swing_lows[-1][1] if swing_lows else None
+
+        position = "inside"
+        if last_high and c[-1] > last_high:
+            position = "break_up"
+        elif last_low and c[-1] < last_low:
+            position = "break_down"
+
+        return trend, strength, position, last_high, last_low
+
+    # =====================================================
+    # 1️⃣ Entry结构（短期）
+    # =====================================================
+    entry_trend, entry_strength, position, last_high, last_low = detect_structure(
+        high, low, close, ENTRY_LOOKBACK
+    )
+
+    # =====================================================
+    # 2️⃣ Bias结构（中期）
+    # =====================================================
+    bias_trend, bias_strength, _, _, _ = detect_structure(
+        high, low, close, BIAS_LOOKBACK
+    )
+
+    # =====================================================
+    # 3️⃣ 评分系统
+    # =====================================================
+    score = 1
+    weak_signal = False
+
+    # Entry一致性（最重要）
+    if direction == entry_trend:
+        score += 4
+    else:
+        weak_signal = True
+
+    # Bias一致性
+    if direction == bias_trend:
+        score += 2
+
+    # 双一致强化
+    if direction == entry_trend and direction == bias_trend:
+        score += 2
+
+    # 突破
+    if position == "break_up" and direction == "long":
+        score += 2
+    elif position == "break_down" and direction == "short":
+        score += 2
+
+    # 范围限制
+    score = max(1, min(score, 10))
+
+    # =====================================================
+    # 4️⃣ 分类
+    # =====================================================
+    if weak_signal:
+        subtype = "weak_counter_trend"
+    elif score >= 8:
+        subtype = "strong_trend_aligned"
+    elif score >= 5:
+        subtype = "trend_aligned"
+    else:
+        subtype = "neutral_structure"
+
+    return {
+        "score": score,
+        "type": "structure_alignment",
+        "subtype": subtype,
+        "meta": {
+            "entry_trend": entry_trend,
+            "bias_trend": bias_trend,
+            "entry_strength": entry_strength,
+            "bias_strength": bias_strength,
+            "position": position,
+            "weak_signal": weak_signal,
+            "last_high": last_high,
+            "last_low": last_low
+        }
+    }
+import numpy as np
+
+# =========================================================
+# 压缩释放模块（Compression → Expansion）
+# 输出 score 1-10
+# =========================================================
+
+# -----------------------------
+# 参数设置（可调）
+# -----------------------------
+COMPRESSION_LOOKBACK = 30       # 计算平均波幅的回看周期
+ATR_PERIOD = 14                 # ATR周期
+BB_PERIOD = 20                  # 布林带周期
+BB_STD = 2                      # 布林带标准差
+MIN_BODY_RATIO = 0.25           # K线实体/总波幅比例，判断压缩
+EXPANSION_THRESHOLD = 1.2       # 当前波幅超过平均波幅倍数则认为爆发
+
+# -----------------------------
+# 计算ATR
+# -----------------------------
+def compute_atr(high, low, close, period=14):
+    high = np.array(high)
+    low = np.array(low)
+    close = np.array(close)
+    tr = np.maximum(high[1:] - low[1:], 
+                    np.abs(high[1:] - close[:-1]),
+                    np.abs(low[1:] - close[:-1]))
+    atr = np.zeros(len(close))
+    atr[period:] = np.convolve(tr, np.ones(period)/period, mode='valid')
+    return atr
+
+# -----------------------------
+# 计算布林带
+# -----------------------------
+def compute_bb(close, period=20, std=2):
+    close = np.array(close)
+    ma = np.convolve(close, np.ones(period)/period, mode='valid')
+    std_dev = np.array([np.std(close[i-period:i]) for i in range(period, len(close)+1)])
+    upper = ma + std * std_dev
+    lower = ma - std * std_dev
+    return upper, lower, ma
+
+# -----------------------------
+# K线实体比例
+# -----------------------------
+def candle_body_ratio(open_price, close_price, high, low):
+    body = abs(close_price - open_price)
+    total_range = high - low
+    ratio = body / total_range if total_range != 0 else 0
+    return ratio
+
+# -----------------------------
+# 压缩评分
+# -----------------------------
+def compression_score(open_price, high, low, close):
+    score = 1
+
+    # ATR压缩加分
+    atr = compute_atr(high, low, close, period=ATR_PERIOD)
+    if atr[-1] < np.mean(atr[-COMPRESSION_LOOKBACK:]):
+        score += 3
+
+    # 布林带压缩加分
+    upper_bb, lower_bb, _ = compute_bb(close, period=BB_PERIOD, std=BB_STD)
+    bb_width = upper_bb[-1] - lower_bb[-1]
+    if bb_width < np.mean(upper_bb[-COMPRESSION_LOOKBACK:] - lower_bb[-COMPRESSION_LOOKBACK:]):
+        score += 3
+
+    # K线实体压缩加分
+    body_ratio = candle_body_ratio(open_price[-1], close[-1], high[-1], low[-1])
+    if body_ratio < MIN_BODY_RATIO:
+        score += 2
+
+    # 爆发迹象加分（当前K线波幅超过平均波幅倍数）
+    avg_range = np.mean(np.array(high[-COMPRESSION_LOOKBACK:]) - np.array(low[-COMPRESSION_LOOKBACK:]))
+    current_range = high[-1] - low[-1]
+    if current_range > EXPANSION_THRESHOLD * avg_range:
+        score += 2
+
+    # 限制1-10分
+    score = max(1, min(score, 10))
+
+    return score, atr[-1], bb_width, body_ratio, current_range
+
+# -----------------------------
+# 模块封装
+# -----------------------------
+def compression_expansion_module(open_price, high, low, close):
+    """
+    压缩释放模块主函数
+    输入: open_price, high, low, close 数组
+    输出: score(1-10), meta信息
+    """
+    score, atr_val, bb_width, body_ratio, curr_range = compression_score(open_price, high, low, close)
+
+    return {
+        "score": score,
+        "type": "compression_expansion",
+        "meta": {
+            "atr": atr_val,
+            "bb_width": bb_width,
+            "candle_body_ratio": body_ratio,
+            "current_range": curr_range
+        }
+    }
+
+# =========================================================
+# 使用示例：
+# open_price = [..]
+# high = [..]
+# low = [..]
+# close = [..]
+# result = compression_expansion_module(open_price, high, low, close)
+# print(result)
+# =========================================================
