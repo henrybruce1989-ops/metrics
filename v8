@@ -22,7 +22,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 API_KEY = "YOUR_BINANCE_API_KEY"
 API_SECRET = "YOUR_BINANCE_API_SECRET"
 
-SERVER_CHAN_KEY = "YOUR_SERVER_CHAN_KEY"
+SERVER_CHAN_KEY = "sctp14659thuntd89pzhhlsmbwynooxu"
 
 # 五角雷达参数
 LOOKBACK = 30
