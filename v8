@@ -1,0 +1,808 @@
+# =========================================================
+# ================== 基础库 & 配置 ======================
+# =========================================================
+import time
+import csv
+import json
+import os
+import requests
+import threading
+from datetime import datetime
+from collections import deque
+import numpy as np
+import pandas as pd
+
+from binance.client import Client
+from binance import ThreadedWebsocketManager
+from binance.exceptions import BinanceAPIException, BinanceRequestException
+
+# =========================================================
+# ================== 全局参数（可调） ====================
+# =========================================================
+API_KEY = "YOUR_BINANCE_API_KEY"
+API_SECRET = "YOUR_BINANCE_API_SECRET"
+
+SERVER_CHAN_KEY = "YOUR_SERVER_CHAN_KEY"
+
+# 五角雷达参数
+LOOKBACK = 30
+THRESHOLD = 0.001
+WICK_RATIO_THRESHOLD = 1.5
+EXTREME_WICK_RATIO = 2.5
+MIN_BODY = 1
+
+MOMENTUM_LOOKBACK = 10
+CONSECUTIVE_COUNT = 3
+MOMENTUM_THRESHOLD_1 = 1.5
+MOMENTUM_THRESHOLD_2 = 2.0
+MOMENTUM_THRESHOLD_EXTREME = 3.0
+STRONG_CLOSE_RATIO = 0.7
+
+VOLUME_LOOKBACK = 20
+VOLUME_TREND_COUNT = 3
+VOLUME_THRESHOLD_1 = 1.5
+VOLUME_THRESHOLD_2 = 2.0
+VOLUME_THRESHOLD_EXTREME = 3.0
+
+BIAS_LOOKBACK = 50
+SWING_WINDOW = 2
+ENTRY_LOOKBACK = 20
+
+EPS = 1e-8
+
+ATR_PERIOD = 14
+BB_PERIOD = 20
+BB_STD = 2
+COMPRESSION_LOOKBACK = 20
+MIN_BODY_RATIO = 0.25
+EXPANSION_THRESHOLD = 1.5
+
+SIGNAL_PUSH_THRESHOLD = 7
+
+# 交易对筛选条件
+MIN_24H_VOLUME_USDT = 15_000_000
+
+# K线缓存长度
+KLINE_CACHE_LENGTH = 500
+
+# =========================================================
+# ================== Binance 客户端 =====================
+# =========================================================
+client = Client(API_KEY, API_SECRET)
+
+# =========================================================
+# ================== K线缓存（唯一版本） =================
+# =========================================================
+class KlineCache:
+    def __init__(self):
+        self.data = {}
+
+    def update(self, symbol, kline):
+        if symbol not in self.data:
+            self.data[symbol] = deque(maxlen=KLINE_CACHE_LENGTH)
+        self.data[symbol].append(kline)
+
+    def get_all(self, symbol):
+        return list(self.data.get(symbol, []))
+
+kline_cache = KlineCache()
+
+# =========================================================
+# ================== Server酱推送 ========================
+# =========================================================
+def send_serverchan(text):
+    try:
+        url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+        requests.post(url, data={"title": "交易信号", "desp": text}, timeout=5)
+    except Exception as e:
+        print(f"[Server酱异常] {e}")
+
+# =========================================================
+# ================== CSV存储 =============================
+# =========================================================
+def save_signal_csv(symbol, signals, filename="signals.csv"):
+    row = {
+        "symbol": symbol,
+        "time": datetime.now(),
+        "direction": signals["overall_direction"],
+        "avg_score": signals["avg_score"],
+
+        "liquidity_score": signals["liquidity"]["score"],
+        "momentum_score": signals["momentum"]["score"],
+        "volume_score": signals["volume"]["score"],
+        "structure_score": signals["structure"]["score"],
+        "compression_score": signals["compression"]["score"],
+
+        "liquidity_meta": json.dumps(signals["liquidity"]["meta"]),
+        "momentum_meta": json.dumps(signals["momentum"]["meta"]),
+        "volume_meta": json.dumps(signals["volume"]["meta"]),
+        "structure_meta": json.dumps(signals["structure"]["meta"]),
+        "compression_meta": json.dumps(signals["compression"]["meta"])
+    }
+
+    try:
+        df = pd.DataFrame([row])
+        if not os.path.exists(filename):
+            df.to_csv(filename, index=False)
+        else:
+            df.to_csv(filename, mode='a', header=False, index=False)
+    except Exception as e:
+        print(f"[CSV异常] {e}")
+
+# =========================================================
+# ================== 动态筛选币对 ========================
+# =========================================================
+def get_active_symbols():
+    symbols = []
+    try:
+        tickers = client.get_ticker()
+        for t in tickers:
+            if t['symbol'].endswith("USDT"):
+                if float(t['quoteVolume']) >= MIN_24H_VOLUME_USDT:
+                    symbols.append(t['symbol'])
+    except Exception as e:
+        print(f"[币对筛选异常] {e}")
+    return symbols
+
+# =========================================================
+# ================== WebSocket 管理 ======================
+# =========================================================
+class BinanceWS:
+    def __init__(self, symbols, interval="1m"):
+        self.symbols = symbols
+        self.interval = interval
+        self.twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+        self.running = False
+        self.lock = threading.Lock()
+
+    def start(self):
+        self.running = True
+        self.twm.start()
+        self._subscribe_all()
+
+    def stop(self):
+        self.running = False
+        try:
+            self.twm.stop()
+        except:
+            pass
+
+    def _subscribe_all(self):
+        for s in self.symbols:
+            self.twm.start_kline_socket(
+                callback=self._kline_callback,
+                symbol=s,
+                interval=self.interval
+            )
+
+    def _kline_callback(self, msg):
+        if msg['e'] != 'kline':
+            return
+
+        k = msg['k']
+
+        # ✅ 只处理收盘K线（关键修复）
+        if not k['x']:
+            return
+
+        kline_cache.update(k['s'], {
+            "open": float(k['o']),
+            "high": float(k['h']),
+            "low": float(k['l']),
+            "close": float(k['c']),
+            "volume": float(k['v']),
+            "timestamp": k['t']
+        })
+
+    def update_symbols(self, new_symbols):
+        with self.lock:
+            self.stop()
+            self.symbols = new_symbols
+            self.twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+            self.start()
+
+# =========================================================
+# ================== WS 管理线程 =========================
+# =========================================================
+ws_manager = None
+
+def symbol_manager_loop():
+    global ws_manager
+    while True:
+        try:
+            new_symbols = get_active_symbols()
+            if set(new_symbols) != set(ws_manager.symbols):
+                print(f"[币对更新] {len(new_symbols)} 个")
+                ws_manager.update_symbols(new_symbols)
+        except Exception as e:
+            print(f"[币对管理异常] {e}")
+        time.sleep(60)
+
+def reconnect_loop():
+    global ws_manager
+    while True:
+        try:
+            if not ws_manager.running:
+                print("[WS重连]")
+                ws_manager.start()
+        except Exception as e:
+            print(f"[重连异常] {e}")
+        time.sleep(10)
+
+def init_ws():
+    global ws_manager
+    symbols = get_active_symbols()
+    print(f"[初始化WS] 币对数量: {len(symbols)}")
+
+    ws_manager = BinanceWS(symbols)
+    ws_manager.start()
+
+    threading.Thread(target=symbol_manager_loop, daemon=True).start()
+    threading.Thread(target=reconnect_loop, daemon=True).start()
+              
+# ================== 五角雷达各指标模块 ==================
+# 原封不动导入你提供的模块代码
+# 1. 流动性触发
+def liquidity_event(high, low, open_, close):
+    prev_high = max(high[-LOOKBACK-1:-1])
+    prev_low  = min(low[-LOOKBACK-1:-1])
+
+    h = high[-1]
+    l = low[-1]
+    o = open_[-1]
+    c = close[-1]
+
+    sweep_high = h > prev_high * (1 + THRESHOLD)
+    sweep_low  = l < prev_low  * (1 - THRESHOLD)
+
+    fake_break_high = sweep_high and c < prev_high
+    fake_break_low  = sweep_low  and c > prev_low
+
+    body = max(abs(c - o), MIN_BODY)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    wick_ratio_up = upper_wick / body
+    wick_ratio_down = lower_wick / body
+
+    strong_rejection_high = fake_break_high and wick_ratio_up > WICK_RATIO_THRESHOLD
+    strong_rejection_low  = fake_break_low  and wick_ratio_down > WICK_RATIO_THRESHOLD
+
+    direction = None
+    if strong_rejection_low:
+        direction = "long"
+    elif strong_rejection_high:
+        direction = "short"
+    elif sweep_low:
+        direction = "long"
+    elif sweep_high:
+        direction = "short"
+
+    score = 1
+    if sweep_high or sweep_low:
+        score += 3
+    if fake_break_high or fake_break_low:
+        score += 3
+    if strong_rejection_high or strong_rejection_low:
+        score += 2
+    if wick_ratio_up > EXTREME_WICK_RATIO or wick_ratio_down > EXTREME_WICK_RATIO:
+        score += 1
+    score = min(score, 10)
+
+    if score >= 8:
+        subtype = "strong_rejection"
+    elif score >= 6:
+        subtype = "rejection"
+    elif score >= 4:
+        subtype = "sweep"
+    else:
+        subtype = "none"
+
+    return {
+        "score": score,
+        "direction": direction,
+        "type": "liquidity_event",
+        "subtype": subtype,
+        "meta": {
+            "prev_high": prev_high,
+            "prev_low": prev_low,
+            "wick_ratio_up": wick_ratio_up,
+            "wick_ratio_down": wick_ratio_down
+        }
+    }
+              
+# =========================================================
+# ================== Momentum Expansion ==================
+# =========================================================
+def momentum_expansion(high, low, open_, close):
+    if len(high) < MOMENTUM_LOOKBACK + CONSECUTIVE_COUNT:
+        return {"score":1,"direction":None,"type":"momentum_expansion","subtype":"invalid","meta":{}}
+
+    total_range = sum(high[-MOMENTUM_LOOKBACK-1:-1] - low[-MOMENTUM_LOOKBACK-1:-1])
+    avg_range = total_range / MOMENTUM_LOOKBACK
+    current_range = high[-1] - low[-1]
+    momentum_ratio = current_range / (avg_range + EPS)
+
+    close_position = (close[-1] - low[-1]) / (current_range + EPS)
+    strong_close_long = close_position > (1 - STRONG_CLOSE_RATIO)
+    strong_close_short = close_position < STRONG_CLOSE_RATIO
+
+    direction = None
+    if strong_close_long:
+        direction = "long"
+    elif strong_close_short:
+        direction = "short"
+
+    def consecutive(direction_type):
+        for i in range(-CONSECUTIVE_COUNT, 0):
+            if direction_type == "bull" and close[i] <= open_[i]:
+                return False
+            if direction_type == "bear" and close[i] >= open_[i]:
+                return False
+        return True
+
+    bull_seq = consecutive("bull")
+    bear_seq = consecutive("bear")
+
+    score = 1
+    if momentum_ratio > MOMENTUM_THRESHOLD_1: score += 3
+    if momentum_ratio > MOMENTUM_THRESHOLD_2: score += 2
+    if strong_close_long or strong_close_short: score += 2
+    if bull_seq or bear_seq: score += 1
+    if momentum_ratio > MOMENTUM_THRESHOLD_EXTREME: score += 1
+    score = min(score, 10)
+
+    if score >= 9: subtype="explosive"
+    elif score >= 7: subtype="strong"
+    else: subtype="weak"
+
+    return {
+        "score": score,
+        "direction": direction,
+        "type": "momentum_expansion",
+        "subtype": subtype,
+        "meta": {
+            "momentum_ratio": momentum_ratio,
+            "avg_range": avg_range,
+            "current_range": current_range,
+            "close_position": close_position,
+            "bull_seq": bull_seq,
+            "bear_seq": bear_seq
+        }
+    }
+
+# =========================================================
+# ================== Volume Participation ================
+# =========================================================
+def volume_participation(volume, close):
+    if len(volume) < VOLUME_LOOKBACK + 2:
+        return {"score":1,"direction":None,"type":"volume_participation","subtype":"invalid","meta":{}}
+
+    avg_volume = sum(volume[-VOLUME_LOOKBACK-1:-1])/VOLUME_LOOKBACK
+    current_volume = volume[-1]
+    volume_ratio = current_volume / (avg_volume + EPS)
+
+    price_up = close[-1] > close[-2]
+    price_down = close[-1] < close[-2]
+    volume_up = volume[-1] > volume[-2]
+
+    confirm_long = price_up and volume_up
+    confirm_short = price_down and volume_up
+
+    direction = None
+    if confirm_long: direction="long"
+    elif confirm_short: direction="short"
+
+    def volume_trend():
+        for i in range(-VOLUME_TREND_COUNT, 0):
+            if volume[i] <= volume[i-1]: return False
+        return True
+
+    sustained = volume_trend()
+    divergence = (price_up and not volume_up) or (price_down and not volume_up)
+
+    score = 1
+    if volume_ratio > VOLUME_THRESHOLD_1: score += 3
+    if volume_ratio > VOLUME_THRESHOLD_2: score += 2
+    if confirm_long or confirm_short: score += 2
+    if sustained: score += 1
+    if volume_ratio > VOLUME_THRESHOLD_EXTREME: score += 1
+    if divergence: score -= 1
+    score = max(1, min(score, 10))
+
+    if score >= 9: subtype="explosive_volume"
+    elif score >= 7: subtype="confirmed_volume"
+    elif score >= 5: subtype="neutral_volume"
+    else: subtype="weak_volume"
+
+    return {
+        "score": score,
+        "direction": direction,
+        "type": "volume_participation",
+        "subtype": subtype,
+        "meta": {
+            "volume_ratio": volume_ratio,
+            "avg_volume": avg_volume,
+            "current_volume": current_volume,
+            "sustained": sustained,
+            "divergence": divergence
+        }
+    }
+
+# =========================================================
+# ================== Structure Alignment =================
+# =========================================================
+def structure_alignment_v2(high, low, close, direction):
+    if len(close) < BIAS_LOOKBACK + SWING_WINDOW*2:
+        return {"score":1,"type":"structure_alignment","subtype":"invalid","meta":{}}
+
+    def detect_structure(high, low, close, lookback):
+        h = high[-lookback:]
+        l = low[-lookback:]
+        c = close[-lookback:]
+
+        swing_highs=[]
+        swing_lows=[]
+        for i in range(SWING_WINDOW, len(h)-SWING_WINDOW):
+            if all(h[i]>h[i-j] and h[i]>h[i+j] for j in range(1,SWING_WINDOW+1)): swing_highs.append((i,h[i]))
+            if all(l[i]<l[i-j] and l[i]<l[i+j] for j in range(1,SWING_WINDOW+1)): swing_lows.append((i,l[i]))
+
+        hh = hl = lh = ll = 0
+        for i in range(1,len(swing_highs)):
+            if swing_highs[i][1] > swing_highs[i-1][1]: hh+=1
+            else: lh+=1
+        for i in range(1,len(swing_lows)):
+            if swing_lows[i][1] > swing_lows[i-1][1]: hl+=1
+            else: ll+=1
+
+        total = hh+hl+lh+ll+EPS
+        bullish_score = (hh+hl)/total
+        bearish_score = (lh+ll)/total
+
+        if bullish_score>0.6: trend="long"; strength=bullish_score
+        elif bearish_score>0.6: trend="short"; strength=bearish_score
+        else: trend="range"; strength=max(bullish_score,bearish_score)
+
+        last_high = swing_highs[-1][1] if swing_highs else None
+        last_low = swing_lows[-1][1] if swing_lows else None
+
+        position="inside"
+        if last_high and c[-1]>last_high: position="break_up"
+        elif last_low and c[-1]<last_low: position="break_down"
+
+        return trend, strength, position, last_high, last_low
+
+    entry_trend, entry_strength, position, last_high, last_low = detect_structure(high, low, close, ENTRY_LOOKBACK)
+    bias_trend, bias_strength, _, _, _ = detect_structure(high, low, close, BIAS_LOOKBACK)
+
+    score = 1
+    weak_signal=False
+    if direction==entry_trend: score+=4
+    else: weak_signal=True
+    if direction==bias_trend: score+=2
+    if direction==entry_trend and direction==bias_trend: score+=2
+    if position=="break_up" and direction=="long": score+=2
+    if position=="break_down" and direction=="short": score+=2
+    score = max(1, min(score,10))
+
+    if weak_signal: subtype="weak_counter_trend"
+    elif score>=8: subtype="strong_trend_aligned"
+    elif score>=5: subtype="trend_aligned"
+    else: subtype="neutral_structure"
+
+    return {
+        "score":score,
+        "type":"structure_alignment",
+        "subtype":subtype,
+        "meta":{
+            "entry_trend":entry_trend,
+            "bias_trend":bias_trend,
+            "entry_strength":entry_strength,
+            "bias_strength":bias_strength,
+            "position":position,
+            "weak_signal":weak_signal,
+            "last_high":last_high,
+            "last_low":last_low
+        }
+    }  
+
+# =========================================================
+# ================== Compression Expansion =================
+# =========================================================
+def compute_atr(high, low, close, period=14):
+    high = np.array(high)
+    low = np.array(low)
+    close = np.array(close)
+    tr = np.maximum(high[1:] - low[1:], np.abs(high[1:]-close[:-1]), np.abs(low[1:]-close[:-1]))
+    atr = np.zeros(len(close))
+    if len(tr) >= period:
+        atr[period:] = np.convolve(tr, np.ones(period)/period, mode='valid')
+    return atr
+
+def compute_bb(close, period=20, std=2):
+    close = np.array(close)
+    ma = np.convolve(close, np.ones(period)/period, mode='valid')
+    std_dev = np.array([np.std(close[i-period:i]) for i in range(period, len(close)+1)])
+    upper = ma + std * std_dev
+    lower = ma - std * std_dev
+    return upper, lower, ma
+
+def candle_body_ratio(open_price, close_price, high, low):
+    body = abs(close_price - open_price)
+    total_range = high - low
+    return body / total_range if total_range !=0 else 0
+
+def compression_score(open_price, high, low, close):
+    score=1
+    atr=compute_atr(high, low, close, ATR_PERIOD)
+    if len(atr) >= COMPRESSION_LOOKBACK and atr[-1]<np.mean(atr[-COMPRESSION_LOOKBACK:]): score+=3
+    upper_bb, lower_bb, _ = compute_bb(close, BB_PERIOD, BB_STD)
+    if len(upper_bb) >= COMPRESSION_LOOKBACK:
+        bb_width = upper_bb[-1]-lower_bb[-1]
+        if bb_width < np.mean(upper_bb[-COMPRESSION_LOOKBACK:]-lower_bb[-COMPRESSION_LOOKBACK:]): score+=3
+    else:
+        bb_width = 0
+    body_ratio=candle_body_ratio(open_price[-1], close[-1], high[-1], low[-1])
+    if body_ratio<MIN_BODY_RATIO: score+=2
+    avg_range = np.mean(np.array(high[-COMPRESSION_LOOKBACK:])-np.array(low[-COMPRESSION_LOOKBACK:]))
+    current_range = high[-1]-low[-1]
+    if current_range>EXPANSION_THRESHOLD*avg_range: score+=2
+    score = max(1,min(score,10))
+    return score, atr[-1], bb_width, body_ratio, current_range
+
+def compression_expansion_module(open_price, high, low, close):
+    score, atr_val, bb_width, body_ratio, curr_range = compression_score(open_price, high, low, close)
+    return {
+        "score":score,
+        "type":"compression_expansion",
+        "meta":{
+            "atr":atr_val,
+            "bb_width":bb_width,
+            "candle_body_ratio":body_ratio,
+            "current_range":curr_range
+        }
+    }
+
+# =========================================================
+# ================== 五角雷达封装适配层 ===================
+# =========================================================
+# ⚠️ 作用：把 kline_cache 的 dict 数据 → 转换为数组输入
+# ⚠️ 不改变任何指标逻辑，只做输入适配
+
+def extract_ohlcv_arrays(klines):
+    open_ = np.array([k["open"] for k in klines])
+    high = np.array([k["high"] for k in klines])
+    low = np.array([k["low"] for k in klines])
+    close = np.array([k["close"] for k in klines])
+    volume = np.array([k["volume"] for k in klines])
+    return open_, high, low, close, volume
+
+
+# =========================================================
+# ================== 五角雷达总调度（核心入口） ============
+# =========================================================
+# ⚠️ 这是唯一新增函数（不改你任何模块逻辑）
+# ⚠️ 只是把五个模块串起来
+
+def calculate_five_radar(klines):
+    if len(klines) < 100:
+        return None
+
+    open_, high, low, close, volume = extract_ohlcv_arrays(klines)
+
+    # ================== 1. 流动性 ==================
+    liquidity = liquidity_event(high, low, open_, close)
+
+    # ================== 2. 动量 ====================
+    momentum = momentum_expansion(high, low, open_, close)
+
+    # ================== 3. 成交量 ==================
+    volume_sig = volume_participation(volume, close)
+
+    # ================== 4. 结构 ====================
+    structure = structure_alignment_v2(
+        high, low, close,
+        liquidity.get("direction") or momentum.get("direction")
+    )
+
+    # ================== 5. 压缩扩张 ================
+    compression = compression_expansion_module(open_, high, low, close)
+
+    # ================== 汇总评分 ===================
+    scores = [
+        liquidity["score"],
+        momentum["score"],
+        volume_sig["score"],
+        structure["score"],
+        compression["score"]
+    ]
+
+    avg_score = float(np.mean(scores))
+
+    # ================== 方向统一 ===================
+    directions = [
+        liquidity.get("direction"),
+        momentum.get("direction"),
+        volume_sig.get("direction")
+    ]
+
+    long_count = directions.count("long")
+    short_count = directions.count("short")
+
+    final_direction = None
+    if long_count > short_count:
+        final_direction = "long"
+    elif short_count > long_count:
+        final_direction = "short"
+
+    # ================== 返回完整结构 ===================
+    return {
+        "symbol": None,  # 第三部分填充
+        "timestamp": int(time.time() * 1000),
+
+        "avg_score": avg_score,
+        "direction": final_direction,
+
+        "liquidity": liquidity,
+        "momentum": momentum,
+        "volume": volume_sig,
+        "structure": structure,
+        "compression": compression
+    }
+
+# =========================================================
+# ================== 信号去重模块 =========================
+# =========================================================
+class SignalDeduplicator:
+    def __init__(self):
+        self.last_signal_time = {}  # symbol -> timestamp
+
+    def is_new_signal(self, symbol, kline_ts):
+        last_ts = self.last_signal_time.get(symbol)
+        if last_ts == kline_ts:
+            return False
+        self.last_signal_time[symbol] = kline_ts
+        return True
+
+signal_filter = SignalDeduplicator()
+
+
+# =========================================================
+# ================== CSV写入（完整字段） ==================
+# =========================================================
+def save_full_csv(signal, filename="signals_full.csv"):
+    row = {
+        "symbol": signal["symbol"],
+        "timestamp": signal["timestamp"],
+        "direction": signal["direction"],
+        "avg_score": signal["avg_score"],
+
+        "liquidity_score": signal["liquidity"]["score"],
+        "liquidity_direction": signal["liquidity"]["direction"],
+        "liquidity_subtype": signal["liquidity"]["subtype"],
+        "liquidity_meta": json.dumps(signal["liquidity"]["meta"]),
+
+        "momentum_score": signal["momentum"]["score"],
+        "momentum_direction": signal["momentum"]["direction"],
+        "momentum_subtype": signal["momentum"]["subtype"],
+        "momentum_meta": json.dumps(signal["momentum"]["meta"]),
+
+        "volume_score": signal["volume"]["score"],
+        "volume_direction": signal["volume"]["direction"],
+        "volume_subtype": signal["volume"]["subtype"],
+        "volume_meta": json.dumps(signal["volume"]["meta"]),
+
+        "structure_score": signal["structure"]["score"],
+        "structure_subtype": signal["structure"]["subtype"],
+        "structure_meta": json.dumps(signal["structure"]["meta"]),
+
+        "compression_score": signal["compression"]["score"],
+        "compression_meta": json.dumps(signal["compression"]["meta"])
+    }
+
+    df = pd.DataFrame([row])
+    if not os.path.exists(filename):
+        df.to_csv(filename, index=False)
+    else:
+        df.to_csv(filename, mode="a", header=False, index=False)
+
+
+# =========================================================
+# ================== 推送模块（Server酱） ==================
+# =========================================================
+def format_push(signal):
+    return f"""
+【交易信号】
+币种: {signal['symbol']}
+方向: {signal['direction']}
+评分: {signal['avg_score']:.2f}
+
+—— 五角雷达 ——
+流动性: {signal['liquidity']['score']} ({signal['liquidity']['subtype']})
+动量: {signal['momentum']['score']} ({signal['momentum']['subtype']})
+成交量: {signal['volume']['score']} ({signal['volume']['subtype']})
+结构: {signal['structure']['score']} ({signal['structure']['subtype']})
+压缩: {signal['compression']['score']}
+
+—— META ——
+流动性: {signal['liquidity']['meta']}
+动量: {signal['momentum']['meta']}
+成交量: {signal['volume']['meta']}
+结构: {signal['structure']['meta']}
+压缩: {signal['compression']['meta']}
+"""
+
+# =========================================================
+# ================== 信号触发核心 =========================
+# =========================================================
+def process_symbol(symbol):
+    klines = kline_cache.get_all(symbol)
+    if len(klines) < 100:
+        return
+
+    last_k = klines[-1]
+    k_ts = last_k["timestamp"]
+
+    # ✅ 去重
+    if not signal_filter.is_new_signal(symbol, k_ts):
+        return
+
+    signal = calculate_five_radar(klines)
+    if not signal:
+        return
+
+    signal["symbol"] = symbol
+    signal["timestamp"] = k_ts
+
+    # ✅ 信号过滤（核心，不再乱推）
+    if signal["avg_score"] < SIGNAL_PUSH_THRESHOLD:
+        return
+
+    # 至少两个模块同方向
+    dirs = [
+        signal["liquidity"]["direction"],
+        signal["momentum"]["direction"],
+        signal["volume"]["direction"]
+    ]
+
+    if dirs.count("long") < 2 and dirs.count("short") < 2:
+        return
+
+    # ================== 推送 ==================
+    text = format_push(signal)
+    send_serverchan(text)
+
+    # ================== CSV ==================
+    save_full_csv(signal)
+
+    print(f"[信号] {symbol} | {signal['direction']} | {signal['avg_score']}")
+
+
+# =========================================================
+# ================== 主循环（非阻塞） =====================
+# =========================================================
+def main_loop():
+    while True:
+        try:
+            symbols = list(kline_cache.data.keys())
+
+            for symbol in symbols:
+                process_symbol(symbol)
+
+        except Exception as e:
+            print(f"[主循环异常] {e}")
+
+        time.sleep(1)
+
+
+# =========================================================
+# ================== 主程序入口 ===========================
+# =========================================================
+if __name__ == "__main__":
+    print("🚀 系统启动")
+
+    # 初始化WS
+    init_ws()
+
+    # 启动主循环
+    main_loop()      
+  
