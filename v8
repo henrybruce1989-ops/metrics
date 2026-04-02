@@ -59,6 +59,9 @@ EXPANSION_THRESHOLD = 1.5
 
 SIGNAL_PUSH_THRESHOLD = 7
 
+# 心跳监控 WS 是否有新 K线
+last_kline_time = time.time()
+
 # 交易对筛选条件
 MIN_24H_VOLUME_USDT = 15_000_000
 
@@ -176,6 +179,9 @@ class BinanceWS:
             )
 
     def _kline_callback(self, msg):
+        global last_kline_time  # <--- 新增这一行
+        global last_kline_time  # <--- 新增这一行
+
         if msg['e'] != 'kline':
             return
 
@@ -219,14 +225,23 @@ def symbol_manager_loop():
         time.sleep(60)
 
 def reconnect_loop():
-    global ws_manager
+    global ws_manager, last_kline_time
+
     while True:
         try:
+            # 原有逻辑：WS未启动
             if not ws_manager.running:
-                print("[WS重连]")
+                print("[WS重连: 未运行]")
                 ws_manager.start()
+
+            # ✅ 新增：断流检测（核心）
+            if time.time() - last_kline_time > 30:
+                print("[WS断流检测 → 重启WS]")
+                ws_manager.update_symbols(ws_manager.symbols)
+
         except Exception as e:
             print(f"[重连异常] {e}")
+
         time.sleep(10)
 
 def init_ws():
